@@ -1,0 +1,12 @@
+{
+  "model": "xgboost",
+  "seed": 0,
+  "features_count": 32,
+  "metrics": {
+    "accuracy": 0.4848,
+    "precision": 0.4873,
+    "recall": 0.3080,
+    "f1": 0.3775,
+    "auc": 0.4857
+  }
+}
