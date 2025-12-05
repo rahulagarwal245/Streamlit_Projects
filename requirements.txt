@@ -1,0 +1,9 @@
+streamlit==1.22.0
+pandas
+numpy
+joblib
+xgboost==1.7.6
+yfinance==0.2.66
+ta==0.11.0
+mplfinance==0.12.10b0
+matplotlib
