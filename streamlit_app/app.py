@@ -14,71 +14,68 @@ import subprocess
 import sys
 
 # ------------------------------------------------------------
-#                    DOWNLOAD MODEL (Google Drive)
+#                    CONFIG & PATHS
 # ------------------------------------------------------------
-# Replace with your Google Drive file id (you provided it)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILE = os.path.join(BASE_DIR, "xgb_model.joblib")
+SCALER_FILE = os.path.join(BASE_DIR, "scaler.pkl")
+STATS_FILE = os.path.join(BASE_DIR, "model_stats.json")
+META_FILE = os.path.join(BASE_DIR, "best_model_meta.json")
+
+# Google Drive model ID (keep as provided)
 GDRIVE_ID = "1lUxvKR8ISLQNt0ws8p5nnBYnFqmgzcjP"
 MODEL_FILENAME = "xgb_model.joblib"
-MODEL_DEST_PATH = os.path.join(os.getcwd(), "streamlit_app", MODEL_FILENAME)
 
+# ------------------------------------------------------------
+#                    DOWNLOAD MODEL (Google Drive)
+# ------------------------------------------------------------
 def ensure_gdown_installed():
     try:
         import gdown  # noqa: F401
     except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"]) 
         # re-import after install
         import gdown  # noqa: F401
+
 
 def download_model_from_gdrive(gdrive_id, dest_path):
     """
     Download file from Google Drive (uc?id=) using gdown.
-    The function downloads to a temp location first then moves into dest_path.
+    Download directly into the app folder so paths remain consistent.
     """
     ensure_gdown_installed()
     import gdown
 
-    # temp path
-    tmp_path = f"/tmp/{MODEL_FILENAME}"
-    # skip download if already in dest
+    # if file already exists, skip
     if os.path.exists(dest_path):
         return dest_path
 
     url = f"https://drive.google.com/uc?id={gdrive_id}"
     st.info("Model not found locally. Downloading model from Google Drive (one-time)...")
     try:
-        # download to /tmp
-        downloaded = gdown.download(url, tmp_path, quiet=False)
+        # download directly to dest_path
+        downloaded = gdown.download(url, dest_path, quiet=False)
         if downloaded is None:
-            raise RuntimeError("gdown failed to download the model.")
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        # move to final destination
-        shutil.move(tmp_path, dest_path)
+            raise RuntimeError("gdown failed to download the model. Check the Drive ID or sharing settings.")
         st.success("Model downloaded and saved.")
         return dest_path
     except Exception as e:
-        # if download failed, show error and continue (app will stop later if model missing)
         st.error(f"Model download failed: {e}")
         raise
 
-# Attempt download if missing
+
+# Ensure model is present (download if missing)
 try:
-    if not os.path.exists(MODEL_DEST_PATH):
-        download_model_from_gdrive(GDRIVE_ID, MODEL_DEST_PATH)
+    if not os.path.exists(MODEL_FILE):
+        download_model_from_gdrive(GDRIVE_ID, MODEL_FILE)
 except Exception:
-    # allow load_artifacts to show helpful error; stop only if necessary below
+    # allow load_artifacts to show helpful error; app will stop later if model missing
     pass
 
 # ------------------------------------------------------------
 #                    STREAMLIT CONFIGURATION
 # ------------------------------------------------------------
 st.set_page_config(page_title="Candlestick Classifier", layout="wide")
-
-# file names used by rest of the app (must match downloaded model name)
-MODEL_FILE = os.path.join("streamlit_app", "xgb_model.joblib")
-SCALER_FILE = os.path.join("streamlit_app", "scaler.pkl")
-STATS_FILE = os.path.join("streamlit_app", "model_stats.json")
-META_FILE = os.path.join("streamlit_app", "best_model_meta.json")
-
 
 # ------------------------------------------------------------
 #                    LOAD ARTIFACTS
@@ -88,12 +85,19 @@ def load_artifacts():
     artifacts = {}
 
     if os.path.exists(MODEL_FILE):
-        artifacts["model"] = joblib.load(MODEL_FILE)
+        try:
+            artifacts["model"] = joblib.load(MODEL_FILE)
+        except Exception as e:
+            artifacts["model"] = None
+            st.error(f"Failed to load model file: {e}")
     else:
         artifacts["model"] = None
 
     if os.path.exists(SCALER_FILE):
-        artifacts["scaler"] = joblib.load(SCALER_FILE)
+        try:
+            artifacts["scaler"] = joblib.load(SCALER_FILE)
+        except Exception:
+            artifacts["scaler"] = None
     else:
         artifacts["scaler"] = None
 
@@ -101,7 +105,7 @@ def load_artifacts():
         try:
             with open(STATS_FILE, "r") as f:
                 artifacts["stats"] = json.load(f)
-        except:
+        except Exception:
             artifacts["stats"] = None
     else:
         artifacts["stats"] = None
@@ -110,7 +114,7 @@ def load_artifacts():
         try:
             with open(META_FILE, "r") as f:
                 artifacts["meta"] = json.load(f)
-        except:
+        except Exception:
             artifacts["meta"] = None
     else:
         artifacts["meta"] = None
@@ -122,7 +126,7 @@ art = load_artifacts()
 
 # fail-safe checks
 if art["model"] is None:
-    st.error("❌ Model file not found. Please ensure xgb_model.joblib is present under streamlit_app/ or that the Google Drive link is correct.")
+    st.error("❌ Model file not found or failed to load. Please ensure xgb_model.joblib is present under streamlit_app/ or that the Google Drive link is correct.")
     st.stop()
 
 if art["scaler"] is None:
@@ -329,7 +333,7 @@ try:
         importances = art['model'].feature_importances_
         fi = sorted(zip(FEATURE_COLS, importances), key=lambda x: x[1], reverse=True)[:20]
         st.table(pd.DataFrame(fi, columns=["Feature", "Importance"]))
-    except:
+    except Exception:
         st.info("Feature importances unavailable for this model.")
 except Exception as e:
     st.error(f"Prediction failed: {e}")
