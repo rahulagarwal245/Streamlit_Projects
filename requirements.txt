@@ -7,3 +7,4 @@ xgboost==1.7.6
 matplotlib
 mplfinance
 joblib
+gdown
