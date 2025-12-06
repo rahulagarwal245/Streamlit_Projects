@@ -23,7 +23,7 @@ SCALER_FILE = os.path.join(BASE_DIR, "scaler.pkl")
 STATS_FILE = os.path.join(BASE_DIR, "model_stats.json")
 META_FILE = os.path.join(BASE_DIR, "best_model_meta.json")
 
-# Google Drive model ID (keep as provided)
+# Google Drive model ID (if you want auto-download fallback)
 GDRIVE_ID = "1lUxvKR8ISLQNt0ws8p5nnBYnFqmgzcjP"
 MODEL_FILENAME = "xgb_model.joblib"
 
@@ -45,14 +45,12 @@ def download_model_from_gdrive(gdrive_id, dest_path):
     ensure_gdown_installed()
     import gdown
 
-    # if file already exists, skip
     if os.path.exists(dest_path):
         return dest_path
 
     url = f"https://drive.google.com/uc?id={gdrive_id}"
     st.info("Model not found locally. Downloading model from Google Drive (one-time)...")
     try:
-        # download directly to dest_path
         downloaded = gdown.download(url, dest_path, quiet=False)
         if downloaded is None:
             raise RuntimeError("gdown failed to download the model. Check the Drive ID or sharing settings.")
@@ -62,12 +60,11 @@ def download_model_from_gdrive(gdrive_id, dest_path):
         st.error(f"Model download failed: {e}")
         raise
 
-# Try to download model if missing (graceful)
 try:
     if not os.path.exists(MODEL_FILE):
         download_model_from_gdrive(GDRIVE_ID, MODEL_FILE)
 except Exception:
-    # allow load_artifacts to show helpful error; app will stop later if model missing
+    # allow load_artifacts to show helpful error later
     pass
 
 # ------------------------------------------------------------
@@ -280,120 +277,122 @@ elif mode == "Upload CSV (OHLCV)":
                    ["Open", "High", "Low", "Close", "Volume"]
                ].reset_index(drop=True)
 
-else:  # Image mode: try OCR -> parse table OR detect ticker -> fetch via yfinance
-    st.info("Upload an image (screenshot of OHLCV table or screenshot containing ticker).")
+else:  # Image mode: allow OCR if available; require manual ticker as reliable fallback
+    st.info("Upload an image (screenshot of OHLCV table or screenshot containing ticker). You may also enter the ticker below for a reliable fetch.")
     uploaded_img = st.file_uploader("Upload image (png/jpg)", type=["png", "jpg", "jpeg"])
+    manual_ticker = st.text_input("Or enter ticker (e.g. RELIANCE.NS)", value="")
+
+    image_bytes = None
     if uploaded_img is not None:
         image_bytes = uploaded_img.read()
-        # try to import OCR libs
-        ocr_available = True
+
+    # try to import OCR libs
+    ocr_available = True
+    try:
+        from PIL import Image
+        import pytesseract
+        import cv2
+        import numpy as np
+    except Exception:
+        ocr_available = False
+
+    parsed_df = None
+    ticker_from_image = None
+
+    # If OCR is available and the user uploaded an image, attempt OCR parsing (best-effort)
+    if ocr_available and image_bytes is not None:
         try:
-            from PIL import Image
-            import pytesseract
-            import cv2
-            import numpy as np
-        except Exception:
-            ocr_available = False
+            pil_img = Image.open(BytesIO(image_bytes)).convert("RGB")
+            img = np.array(pil_img)[:, :, ::-1].copy()  # RGB->BGR
 
-        # Attempt OCR parsing if OCR libs exist
-        parsed_df = None
-        ticker_from_image = None
-        if ocr_available:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.bilateralFilter(gray, 9, 75, 75)
+            _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            ocr_text = pytesseract.image_to_string(th)
+
+            # First: attempt to find a table-like CSV in OCR text
+            lines = [l.strip() for l in ocr_text.splitlines() if l.strip()]
+            text_blob = "\n".join(lines)
             try:
-                pil_img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                img = np.array(pil_img)[:, :, ::-1].copy()  # RGB->BGR for cv2
-
-                # Preprocess for OCR
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                gray = cv2.bilateralFilter(gray, 9, 75, 75)
-                _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-                ocr_text = pytesseract.image_to_string(th)
-
-                # First: attempt to find a table-like CSV in OCR text
-                lines = [l.strip() for l in ocr_text.splitlines() if l.strip()]
-                text_blob = "\n".join(lines)
-                try:
-                    candidate = pd.read_csv(BytesIO(text_blob.encode()), engine="python")
-                    cols_lower = {c.lower(): c for c in candidate.columns}
-                    if all(k in cols_lower for k in ["open", "high", "low", "close", "volume"]):
-                        parsed_df = candidate.rename(columns={cols_lower["open"]: "Open",
-                                                              cols_lower["high"]: "High",
-                                                              cols_lower["low"]: "Low",
-                                                              cols_lower["close"]: "Close",
-                                                              cols_lower["volume"]: "Volume"})[
-                                     ["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
-                except Exception:
-                    parsed_df = None
-
-                # If no valid parsed_df, try heuristic table parse from lines
-                if parsed_df is None:
-                    # find header line containing Open & High & Low
-                    header_idx = None
-                    for i, ln in enumerate(lines[:8]):  # header likely in first few lines
-                        if re.search(r"open", ln, re.I) and re.search(r"high", ln, re.I) and re.search(r"low", ln, re.I):
-                            header_idx = i
-                            break
-                    if header_idx is not None:
-                        # build table from subsequent lines
-                        header = re.sub(r"[^A-Za-z0-9,\t ]", "", lines[header_idx])
-                        header_cols = re.split(r"[\t,]+|\s{2,}", header)
-                        data_rows = []
-                        for ln in lines[header_idx+1:]:
-                            ln_clean = re.sub(r"[^\d\.\- ,\t]", " ", ln)
-                            parts = re.split(r"[\t,]+|\s{2,}", ln_clean.strip())
-                            if len(parts) >= len(header_cols):
-                                data_rows.append(parts[:len(header_cols)])
-                        if data_rows:
-                            try:
-                                df_candidate = pd.DataFrame(data_rows, columns=header_cols)
-                                cols_lower = {c.lower(): c for c in df_candidate.columns}
-                                if all(k in cols_lower for k in ["open", "high", "low", "close", "volume"]):
-                                    parsed_df = df_candidate.rename(columns={cols_lower["open"]: "Open",
-                                                                             cols_lower["high"]: "High",
-                                                                             cols_lower["low"]: "Low",
-                                                                             cols_lower["close"]: "Close",
-                                                                             cols_lower["volume"]: "Volume"})[
-                                                    ["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
-                            except Exception:
-                                parsed_df = None
-
-                # If still not parsed, try to detect a ticker symbol in OCR text (e.g., RELIANCE.NS or TICKER)
-                if parsed_df is None:
-                    # regex for tickers (A..Z.J) and patterns like RELIANCE.NS
-                    ticker_matches = re.findall(r"\b[A-Z]{2,10}(?:\.NS|\.BO|\.NSX|\.BSE)?\b", ocr_text)
-                    if ticker_matches:
-                        ticker_from_image = ticker_matches[0]
-            except pytesseract.pytesseract.TesseractNotFoundError:
-                ocr_available = False
+                candidate = pd.read_csv(BytesIO(text_blob.encode()), engine="python")
+                cols_lower = {c.lower(): c for c in candidate.columns}
+                if all(k in cols_lower for k in ["open", "high", "low", "close", "volume"]):
+                    parsed_df = candidate.rename(columns={cols_lower["open"]: "Open",
+                                                          cols_lower["high"]: "High",
+                                                          cols_lower["low"]: "Low",
+                                                          cols_lower["close"]: "Close",
+                                                          cols_lower["volume"]: "Volume"})[
+                                 ["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
             except Exception:
                 parsed_df = None
 
-        # If parsed_df from OCR is valid, use it
-        if parsed_df is not None and not parsed_df.empty:
-            df_input = parsed_df
-        else:
-            # If OCR not available or parsing failed, but ticker detected, fetch via yfinance
-            if ticker_from_image:
-                st.info(f"Detected ticker in image: {ticker_from_image}. Fetching OHLCV via yfinance...")
-                try:
-                    df = yf.download(ticker_from_image, period=f"{days}d", progress=False)
-                    if df is None or df.empty:
-                        st.error(f"Could not fetch data for {ticker_from_image}. Please upload CSV instead.")
-                        st.stop()
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = [c[0] for c in df.columns]
-                    df_input = df[["Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
-                except Exception as e:
-                    st.error(f"Failed to fetch ticker {ticker_from_image}: {e}")
+            # If no valid parsed_df, try heuristic table parse from lines
+            if parsed_df is None:
+                header_idx = None
+                for i, ln in enumerate(lines[:8]):  # header likely in first few lines
+                    if re.search(r"open", ln, re.I) and re.search(r"high", ln, re.I) and re.search(r"low", ln, re.I):
+                        header_idx = i
+                        break
+                if header_idx is not None:
+                    header = re.sub(r"[^A-Za-z0-9,\t ]", "", lines[header_idx])
+                    header_cols = re.split(r"[\t,]+|\s{2,}", header)
+                    data_rows = []
+                    for ln in lines[header_idx+1:]:
+                        ln_clean = re.sub(r"[^\d\.\- ,\t]", " ", ln)
+                        parts = re.split(r"[\t,]+|\s{2,}", ln_clean.strip())
+                        if len(parts) >= len(header_cols):
+                            data_rows.append(parts[:len(header_cols)])
+                    if data_rows:
+                        try:
+                            df_candidate = pd.DataFrame(data_rows, columns=header_cols)
+                            cols_lower = {c.lower(): c for c in df_candidate.columns}
+                            if all(k in cols_lower for k in ["open", "high", "low", "close", "volume"]):
+                                parsed_df = df_candidate.rename(columns={cols_lower["open"]: "Open",
+                                                                         cols_lower["high"]: "High",
+                                                                         cols_lower["low"]: "Low",
+                                                                         cols_lower["close"]: "Close",
+                                                                         cols_lower["volume"]: "Volume"})[
+                                                ["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
+                        except Exception:
+                            parsed_df = None
+
+            # If still not parsed, try to detect a ticker symbol in OCR text (e.g., RELIANCE.NS or TICKER)
+            if parsed_df is None:
+                ticker_matches = re.findall(r"\b[A-Z]{2,10}(?:\.NS|\.BO|\.NSX|\.BSE)?\b", ocr_text)
+                if ticker_matches:
+                    ticker_from_image = ticker_matches[0]
+        except pytesseract.pytesseract.TesseractNotFoundError:
+            ocr_available = False
+        except Exception:
+            parsed_df = None
+
+    # Priority: 1) parsed_df from OCR  2) manual_ticker if provided  3) ticker_from_image from OCR
+    if parsed_df is not None and not parsed_df.empty:
+        df_input = parsed_df
+    else:
+        # prefer manual ticker (explicit user input)
+        chosen_ticker = manual_ticker.strip().upper() if manual_ticker.strip() else (ticker_from_image or "")
+        if chosen_ticker:
+            st.info(f"Using ticker: {chosen_ticker}. Fetching last {days} days via yfinance...")
+            try:
+                df = yf.download(chosen_ticker, period=f"{days}d", progress=False)
+                if df is None or df.empty:
+                    st.error(f"Could not fetch data for {chosen_ticker}. Please verify the ticker or upload CSV.")
                     st.stop()
-            else:
-                # No table parsed and no ticker found
-                if not ocr_available:
-                    st.error("OCR libraries or Tesseract binary not available on this server. Fallback: upload a CSV or use the 'Fetch RELIANCE.NS' option.")
-                else:
-                    st.error("OCR could not parse a valid OHLCV table from the image. Best practice: upload a high-resolution screenshot of a table with clear column headers (Open, High, Low, Close, Volume), or upload the CSV directly.")
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [c[0] for c in df.columns]
+                df_input = df[["Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
+            except Exception as e:
+                st.error(f"Failed to fetch ticker {chosen_ticker}: {e}")
                 st.stop()
+        else:
+            # No parsed table, no ticker input/detection
+            if not ocr_available:
+                st.error("OCR libraries or Tesseract binary not available on this server. Please enter ticker manually in the text box above or upload a CSV.")
+            else:
+                st.error("Could not parse a valid OHLCV table from the image. Best practice: upload a high-resolution table screenshot with clear headers, or enter the ticker in the text box above or upload CSV.")
+            st.stop()
 
 # if still no df_input
 if df_input is None:
