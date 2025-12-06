@@ -9,9 +9,10 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import ta
-import shutil
 import subprocess
 import sys
+import re
+from io import BytesIO
 
 # ------------------------------------------------------------
 #                    CONFIG & PATHS
@@ -33,10 +34,8 @@ def ensure_gdown_installed():
     try:
         import gdown  # noqa: F401
     except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"]) 
-        # re-import after install
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
         import gdown  # noqa: F401
-
 
 def download_model_from_gdrive(gdrive_id, dest_path):
     """
@@ -63,8 +62,7 @@ def download_model_from_gdrive(gdrive_id, dest_path):
         st.error(f"Model download failed: {e}")
         raise
 
-
-# Ensure model is present (download if missing)
+# Try to download model if missing (graceful)
 try:
     if not os.path.exists(MODEL_FILE):
         download_model_from_gdrive(GDRIVE_ID, MODEL_FILE)
@@ -121,7 +119,6 @@ def load_artifacts():
 
     return artifacts
 
-
 art = load_artifacts()
 
 # fail-safe checks
@@ -138,7 +135,6 @@ if art["meta"] is None or "feature_columns" not in art["meta"]:
     st.stop()
 
 FEATURE_COLS = art["meta"]["feature_columns"]
-
 
 # ------------------------------------------------------------
 #              FEATURE ENGINEERING PIPELINE
@@ -195,7 +191,6 @@ def compute_features_from_ohlcv(df_raw):
     df = df.dropna().reset_index(drop=True)
     return df
 
-
 # ------------------------------------------------------------
 #              PREDICTION ENGINE
 # ------------------------------------------------------------
@@ -224,16 +219,19 @@ def predict_from_ohlcv(df_input, threshold=0.5):
         "features": last_row[FEATURE_COLS].iloc[0].to_dict()
     }
 
-
 # ------------------------------------------------------------
 #                       UI LAYOUT
 # ------------------------------------------------------------
 st.title("📊 Candlestick Classifier — Next-Day Direction")
 
+# ----------- Sidebar Input Settings -----------
 with st.sidebar:
     st.header("Input Settings")
 
-    mode = st.radio("Select Input Method:", ("Fetch RELIANCE.NS", "Upload CSV (OHLCV)"))
+    mode = st.radio(
+        "Select Input Method:",
+        ("Fetch RELIANCE.NS", "Upload CSV (OHLCV)", "Upload Image (OHLCV screenshot)")
+    )
     days = st.number_input("Days of history", min_value=30, max_value=400, value=60)
     threshold = st.slider("Decision Threshold (Bullish)", 0.0, 1.0, 0.5, 0.01)
 
@@ -243,9 +241,7 @@ with st.sidebar:
         if acc:
             st.metric("Model Accuracy", f"{acc*100:.2f}%")
 
-# ------------------------------------------------------------
-#                INPUT HANDLING
-# ------------------------------------------------------------
+# ----------------- INPUT HANDLING (CSV / IMAGE / YFINANCE) -----------------
 df_input = None
 
 if mode == "Fetch RELIANCE.NS":
@@ -261,12 +257,16 @@ if mode == "Fetch RELIANCE.NS":
 
     df_input = df[["Open", "High", "Low", "Close", "Volume"]].reset_index(drop=True)
 
-else:
+elif mode == "Upload CSV (OHLCV)":
     uploaded = st.file_uploader("Upload OHLCV CSV", type=["csv"])
     if uploaded:
-        df = pd.read_csv(uploaded)
-        cols = {c.lower(): c for c in df.columns}
+        try:
+            df = pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
 
+        cols = {c.lower(): c for c in df.columns}
         required = ["open", "high", "low", "close", "volume"]
         if not all(r in cols for r in required):
             st.error("CSV must contain Open, High, Low, Close, Volume columns.")
@@ -278,74 +278,4 @@ else:
                                       cols["close"]: "Close",
                                       cols["volume"]: "Volume"})[
                    ["Open", "High", "Low", "Close", "Volume"]
-               ].reset_index(drop=True)
-
-if df_input is None:
-    st.warning("Awaiting input…")
-    st.stop()
-
-# ------------------------------------------------------------
-#            DISPLAY INPUT DATA
-# ------------------------------------------------------------
-st.subheader("📘 Input OHLCV Data")
-st.dataframe(df_input.tail(50), height=300)
-
-# ------------------------------------------------------------
-#       CANDLESTICK VISUAL (LARGER)
-# ------------------------------------------------------------
-st.subheader("📈 Candlestick Pattern (Most Recent)")
-
-plot_df = df_input.copy()
-plot_df.index = pd.date_range(end=pd.Timestamp.today(), periods=len(plot_df))
-
-fig, ax = plt.subplots(figsize=(11, 4))
-mpf.plot(plot_df, type="candle", style="charles", ax=ax, volume=False)
-st.pyplot(fig)
-
-# ------------------------------------------------------------
-#                RUN PREDICTION
-# ------------------------------------------------------------
-try:
-    result = predict_from_ohlcv(df_input, threshold=threshold)
-    prob = result["prob"]
-    pred = result["pred"]
-    label = "Bullish" if pred == 1 else "Bearish"
-
-    st.markdown("## 🔮 Prediction Result")
-
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.metric("Next-Day Trend", label, f"{prob*100:.1f}%")
-
-    with col2:
-        st.write(f"**Bullish Probability:** {prob:.4f}")
-        if art["stats"]:
-            st.write(f"**Model Test Accuracy:** {art['stats']['metrics']['accuracy']*100:.2f}%")
-
-    st.subheader("🔍 Feature Values Used (Top 20)")
-    feat_df = pd.DataFrame(
-        list(result["features"].items()), columns=["Feature", "Value"]
-    ).sort_values("Feature")
-    st.dataframe(feat_df.head(20))
-
-    st.subheader("🏆 Model Feature Importances (Top 20)")
-    try:
-        importances = art['model'].feature_importances_
-        fi = sorted(zip(FEATURE_COLS, importances), key=lambda x: x[1], reverse=True)[:20]
-        st.table(pd.DataFrame(fi, columns=["Feature", "Importance"]))
-    except Exception:
-        st.info("Feature importances unavailable for this model.")
-except Exception as e:
-    st.error(f"Prediction failed: {e}")
-    st.stop()
-
-# ------------------------------------------------------------
-#                       DISCLAIMER
-# ------------------------------------------------------------
-st.markdown("---")
-st.markdown("""
-### ⚠️ **Disclaimer**
-This model is experimental and based solely on historical OHLCV patterns.  
-Daily next-day stock direction is highly noisy and difficult to predict reliably.  
-This tool is intended for educational and demonstration purposes only.
-""")
+               ].reset
