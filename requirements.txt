@@ -8,5 +8,7 @@ matplotlib
 mplfinance
 joblib
 gdown
+pillow
+pytesseract
+opencv-python-headless
 scikit-learn==1.5.2
-
