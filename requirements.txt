@@ -2,9 +2,8 @@ streamlit
 pandas
 numpy
 yfinance==0.2.66
-ta==0.11.0
+ta
 xgboost==1.7.6
-scikit-learn==1.2.2
 matplotlib
 mplfinance
 joblib
